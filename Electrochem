@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Oct 28 17:14:54 2022
+
+@author: johannesrohwer
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import datetime
+import os
+import pickle
+import pandas as pd
+
+#%% Parameters
+
+####  Parameters
+Param_gen = {'q_max' : 1.32e4, # Coulomb (C)
+             'R_gas' : 8.314, # J/mol?K
+             'Temp' : 298.15, # K
+             'C_faraday' : 96487, #C/mol
+              'Diff' : 7e6, #mol s/C/m^3
+             'tau_zero' : 10, #s
+             'alpha' : 0.5,
+             'R_bat' : 0.085 #Ohm     
+             }
+
+# Negative electrode parameters
+Param_p = {
+            'S' : 2e-4, # m^2
+              'k' : 2e4, # A/m^2
+             'vs' : 2e-6, #m^3
+             'vb' : 2e-5, #m^3
+             'tau' : 90, #s   
+             }
+
+# Positive electrode parameters
+Param_n = {
+            'S' : 2e-4, # m^2
+              'k' : 2e4, # A/m^2
+             'vs' : 2e-6, #m^3
+             'vb' : 2e-5, #m^3
+             'tau' : 90, #s   
+             }
+
+#### Import experimental data form NASA B0007 cycle 1
+with open('B0006_cycle_5', 'rb') as handle:
+    B0006_c5 = pickle.load(handle) 
+
+
+#### Import non-ideal electrode data (#inf at zero gradient)
+with open('Vu_all', 'rb') as handle:
+    Vu_all = pickle.load(handle)   
+Vu_p_df = Vu_all['V_pos'].interpolate()
+Vu_n_df = Vu_all['V_neg'].interpolate()
+Vu_bat_df = Vu_all['V_bat'].interpolate()
+
+V_max = Vu_bat_df['Voltage'][0] 
+V_min = Vu_bat_df['Voltage'][-2:-1] 
+
+# plt.plot(Vu_bat_df['Voltage'], 'r' )
+
+# plt.plot(Vu_p_df['Voltage'], 'g' )
+
+# plt.plot(Vu_n_df['Voltage'], 'b' )
+
+# plt.plot(Vu_bat_df['x'],Vu_bat_df['Voltage'] )
+
+#%% Functions
+
+#### Non-ideal electrode voltage
+def mol_vol(df, input):
+    row = df.iloc[(df['x']-input).abs().argsort()[:1]]
+    volt_val = row['Voltage'].iloc[0]
+    return volt_val
+
+#### Butler Volmer / Surface Overpotential
+
+# Concentration of Li-ions in bulk(amount of Li-ions, volume)
+def conc_Li_b(Param, q_Li):
+    vb = Param['vb']
+    conc = q_Li / vb
+    return conc
+
+# Concentration of Li-ions in bulk(amount of Li-ions, volume)
+def conc_Li_s(Param, q_Li):
+    vs = Param['vs']
+    conc = q_Li / vs
+    return conc
+
+# Overpotential (current, General parameters, electrode specific params)
+def Overpotential(Param_gen, Param, i, x_si):
+
+    S_i = Param['S']
+    alpha = Param_gen['alpha']
+    k_i = Param['k']
+    R = Param_gen['R_gas']
+    F = Param_gen['C_faraday']
+    T = Param_gen['Temp']
+
+    # Current density
+    J_i = i / S_i # i = current and S_i = lumped constant param
+    # Exchange current density
+    J_i0 = k_i*((1-x_si)**(alpha))*((x_si)**(1-alpha))
+    # Overpotential
+    V_si = ((R*T)/(F*alpha))*np.arcsinh(J_i/(2*J_i0))
+    
+    return V_si
+
+#### Ohmic resistnace in battery
+def V_ohmic(Param_gen, i_app):
+    R_bat = Param_gen['R_bat']
+    V_ohm = i_app * R_bat
+    return V_ohm
+
+#### Bulk to solvent diffusion rate
+def diff_rate(Param_gen, cb_i, cs_i):
+    #Diffusion constant 
+    Diff = Param_gen['Diff']
+    q_bs_i = (1/Diff)*(cb_i - cs_i)
+    return q_bs_i
+
+#### SOC calculator
+# SOC nominal - surfae and bulk (Li-ions in negative electrode)
+def SOC_n(Param_gen, qn):
+    q_max = Param_gen['q_max']
+    SOC_n = qn/(0.6*q_max)
+    return SOC_n
+
+# SOC apparent - only at surface (Li-ions in negative electrode, volume in negative electrode)
+def SOC_a(Param_n, qn):
+    v_term = Param_n['vs']/ (Param_n['vs']+Param_n['vb'])
+    q_max_sn = 0.6*Param_gen['q_max']*v_term
+    SOC_a = q_sn/q_max_sn
+    return SOC_a
+
+# Compensate for time delay in resistance and overpotential
+def V_dasher(V_latest, V_old, tau):
+    V_new = (V_latest - V_old)/ tau
+    return V_new
+
+#### Maximum surface mole fraction
+def fraction_surface(Param, Param_gen, q_si):
+    
+    q_max = Param_gen['q_max']
+
+    v_si = Param['vs']
+    v_bi = Param['vb']
+    v_i = v_si + v_bi
+
+    q_si_max = q_max*(v_si/v_i) 
+    x_si = q_si/ q_si_max
+    
+    return x_si    
+#%% Initial conditions
+
+#### Li-ion locations
+q_max = Param_gen['q_max']
+
+# Concentratio of positive and negative sides
+x_neg = 0.6
+x_pos = 0.4
+
+#### Initial consitions Li-ion distribution
+
+# Volume of negative bulk and surface  
+n_vs_vb = Param_n['vs'] + Param_n['vb']
+# At fully charged - bulk and electrode (surface) have same concentration
+q_sn = x_neg * q_max * (Param_n['vs']/n_vs_vb)  # negative solid electrode
+q_bn = x_neg * q_max * (Param_n['vb']/n_vs_vb)  # negative bulk electrolyte
+
+
+# At fully charged - bulk and electrode (surface) have same concentration
+p_vs_vb = Param_p['vs'] + Param_p['vb']
+q_sp = x_pos * q_max * (Param_p['vs']/p_vs_vb) # positive solid electrode
+q_bp = x_pos * q_max * (Param_p['vb']/p_vs_vb) # positive bulk electrolyte
+
+#### Discharge curve 
+
+# Battery capacity is 2 Ah
+# Discharge time
+time_delta = 1 # Time step between calcs
+t_dis = 3600 # Total discharge time in s
+time = np.round(np.arange(0,t_dis, time_delta), 1)
+c_dis = 2*np.ones(len(time))
+# c_dis = np.zeros(len(time))
+
+
+# Constant 2A discharge
+c_z = np.zeros(17)
+c_exp = 2*np.ones(len(time))
+c_z_end = np.zeros(200)
+# Combine rest and discharge time
+current = np.concatenate((c_z, c_exp, c_z_end))
+
+# Time and Current dataframe
+# d = {'time [s]': time, 'Current [A]': current}
+# It_input = pd.DataFrame(data=d)
+
+#Specific current value for first run
+i_app = 0
+#%% Li-ion distriution
+# (Amount of Li-ion in cell elements)
+
+# Amount of Li-ions in cell
+# Positive side of cell
+q_p = q_sp + q_bp
+# Negative side of cell
+q_n = q_sn + q_bn
+# Entire cell Li-ions
+q_max = q_sp + q_bp + q_sn + q_bn
+
+# Concentrations on positive and negative sides
+x_neg = q_n/ q_max
+x_pos = q_p/ q_max
+
+#%% Diffusion Rate
+
+#### Concentrations
+# Negative conc
+conc_sn = q_sn/Param_n['vs']
+conc_bn = q_bn/Param_n['vb']
+# Positive conc
+conc_sp = q_sp/Param_p['vs']
+conc_bp = q_bp/Param_p['vb']
+
+# Diffusion rate
+# Negative side: Bulk to solid
+qDot_bs_n = diff_rate(Param_gen,conc_bn, conc_sn)
+# Positive side: Bulk to solid
+qDot_bs_p = diff_rate(Param_gen,conc_bp, conc_sp)
+
+#### Rate of lithium movement
+# positive solid
+q_dot_sp =  qDot_bs_p + i_app
+# positive bulk
+q_dot_bp = -qDot_bs_p
+
+# negative bulk
+q_dot_bn = -qDot_bs_n
+# negative solid
+q_dot_sn = qDot_bs_n - i_app
+
+#%% Overpotential
+
+# Mole fraction in negative solid electrode
+x_sn = fraction_surface(Param_n, Param_gen, q_sn)
+
+# Mole fraction in positive electrode
+x_sp = fraction_surface(Param_p, Param_gen, q_sp)
+
+i = i_app
+
+# Negative overpotential 
+V_neta_n = Overpotential(Param_gen, Param_n, i, x_sn)
+#initially there is no time lag
+V_neta_n_dash = V_neta_n
+
+# Positive overpotential 
+V_neta_p = Overpotential(Param_gen, Param_p, i, x_sp)
+#initially there is no time lag
+V_neta_p_dash = V_neta_p
+
+#%% Final voltage calc
+
+#Non ideal electrodes
+Vu_p = mol_vol(Vu_p_df, 1-x_sn)
+Vu_n = mol_vol(Vu_n_df, x_sn)
+
+# Internal resistance
+V_o = V_ohmic(Param_gen, i_app)
+#initially there is no time lag
+V_o_dash = V_o
+
+# Initial terminal voltage
+# V_ini = mol_vol(Vu_bat_df, x_sp)
+
+#Initial voltage
+V_final = Vu_p - Vu_n - V_o_dash - V_neta_n_dash - V_neta_p_dash-0.1
+
+#%% SOC
+# SOC Nominal (bulk and electrode in control volume)
+SOC_n = SOC_n(Param_gen, q_n)
+# SOC Apparent (only and electrode in control volume)
+SOC_a = SOC_a(Param_n, q_sn)
+
+q_max = Param_gen['q_max']
+SOC_n = q_n/(0.6*q_max)
+
+#%% Save all states
+h_states = [time_delta,i_app, Param_gen['Temp'],V_final,SOC_n,SOC_a, Vu_p, Vu_n,V_o_dash,V_neta_n_dash, V_neta_p_dash, q_bn, q_sn, q_bp, q_sp, q_dot_bn, q_dot_sn, q_dot_sp, q_dot_bp]
+df = pd.DataFrame(h_states).T
+df_heads = ['time_delta','i_app','Temp','V_final','SOC_n','SOC_a','Vu_p', 'Vu_n','V_o_dash','V_neta_n_dash', 'V_neta_p_dash', 'q_bn', 'q_sn', 'q_bp', 'q_sp','q_dot_bn', 'q_dot_sn', 'q_dot_sp', 'q_dot_bp']
+df.columns = df_heads
+#%% Table of Battery states
+# Column_heads = ['q_sn [mol]', 'q_bn [mol]', 'q_sp [mol]', 'q_bp [mol]', 'Vu_p','Vu_n','Vo_dash', 'V_neta_n_dash', 'V_neta_p_dash', 'V_final']
+# Column_heads = ['q_sn [mol]', 'q_bn [mol]', 'q_sp [mol', 'q_bp [mol', 'q_dot_sn', 'q_dot_bn', 'q_dot_sp', 'q_dot_bp']
+
+# plt.plot(df_output['x_sp'], df_output['Vu_p'])
+
+# intitialize ohmic resistance rate
+# V_o_dash_r = 0
+
+
+All_vars = []
+# for k in range(0,4):
+for k in range(0,len(current)):  
+# for k in range(0,40):     
+    print(k)
+    # Applied current
+    i_app = current[k]
+    # Final voltage measured at terminal 
+    V_final_old = V_final
+    # Overpotential
+    V_neta_p_old = V_neta_p_dash
+    V_neta_n_old = V_neta_n_dash
+    # Dynamic response of battery 
+    V_o_old = V_o_dash
+    
+    #### OLD
+    q_sn = q_sn + (q_dot_sn * time_delta)
+    q_bn = q_bn + (q_dot_bn * time_delta)
+    q_sp = q_sp + (-q_dot_bp * time_delta)
+    q_bp = q_bp + (q_dot_sp * time_delta)
+
+    # #### NEW
+
+    # q_sn = q_sn + (q_dot_sn * time_delta)
+    # q_bn = q_bn + (q_dot_bn * time_delta)
+    # q_sp = q_sp + (q_dot_bp * time_delta)
+    # q_bp = q_bp + (q_dot_sp * time_delta)
+
+    # Total Li-ions in positive side of cell
+    q_p = q_sp + q_bp
+    #  Total Li-ions in negative side of cell
+    q_n = q_sn + q_bn
+    # Entire cell Li-ions
+    q_max = q_sp + q_bp + q_sn + q_bn
+    # Ionic content in both bulk electrolyte
+    q_bulks = q_bp + q_bn
+    # Ionic content in both electrodes
+    q_solids = q_sp + q_sn
+    # Total amount of Li-ions
+    q_totals = q_bulks + q_solids
+    
+    # Concentrations on positive and negative sides
+    x_neg = q_n/ q_max
+    x_pos = q_p/ q_max
+    
+    #%% Diffusion Rate
+    
+    #### Concentrations
+    # Negative conc
+    conc_sn = q_sn/Param_n['vs']
+    conc_bn = q_bn/Param_n['vb']
+    # Positive conc
+    conc_sp = q_sp/Param_p['vs']
+    conc_bp = q_bp/Param_p['vb']
+    
+    # Diffusion rate
+    # Negative side: Bulk to solid
+    qDot_bs_n = diff_rate(Param_gen,conc_bn, conc_sn)
+    # Positive side: Bulk to solid
+    qDot_bs_p = diff_rate(Param_gen,conc_bp, conc_sp)
+    
+    #### Rate of lithium movement - OLD
+
+    
+    # positive solid
+    q_dot_sp = i_app - qDot_bs_p    
+    # positive bulk
+    q_dot_bp = -qDot_bs_p  
+    # negative bulk
+    q_dot_bn = -qDot_bs_n
+    # negative solid
+    q_dot_sn = -i_app + qDot_bs_n
+
+    #### Rate of lithium movement - NEW
+    
+    # # positive solid
+    # q_dot_sp = i_app + qDot_bs_p   
+    # # positive bulk
+    # q_dot_bp = -qDot_bs_p
+    
+    # # negative bulk
+    # q_dot_bn = -qDot_bs_n
+    # # negative solid
+    # # q_dot_sn = -i_app - qDot_bs_n
+    # q_dot_sn = qDot_bs_n-i_app
+    
+    #%% Overpotential
+    
+    # Mole fraction in negative solid electrode
+    x_sn = fraction_surface(Param_n, Param_gen, q_sn)
+    # print(x_sn)
+    # print('x_sn')
+    # print(x_sn)
+    # Mole fraction in positive electrode
+    x_sp = fraction_surface(Param_p, Param_gen, q_sp)
+    # print(x_sp)
+    
+    i = i_app
+    
+    # Negative overpotential 
+    V_neta_n = Overpotential(Param_gen, Param_n, i, x_sn)
+    V_neta_n_dash_r = V_dasher(V_neta_n, V_neta_n_old, Param_n['tau'])
+    V_neta_n_dash = V_neta_n + (V_neta_n_dash_r * time_delta)
+    # print(V_neta_n_dash_r)
+    V_neta_n_dash = V_neta_n
+    
+    
+    # Positive overpotential 
+    V_neta_p = Overpotential(Param_gen, Param_p, i, x_sp)
+    #initially there is no time lag
+    V_neta_p_dash_r = V_dasher(V_neta_p, V_neta_p_old, Param_p['tau'])
+    V_neta_p_dash =V_neta_p + (V_neta_p_dash_r * time_delta)
+    # print(V_neta_p_dash_r)
+    
+    V_neta_p_dash = V_neta_p
+    
+    # Internal resistance
+    
+    V_o = V_ohmic(Param_gen, i_app)  
+    V_o_dash_r =((V_o-V_o_dash)/Param_gen['tau_zero']) 
+    V_o_dash = V_o_dash_r*time_delta + V_o_old
+    
+    # V_o_dash_r = V_dasher(V_o, V_o_old, Param_gen['tau_zero'])
+    # print(V_o)
+    # V_o_dash_r = V_dasher(V_o, V_o_old, Param_gen['tau_zero'])
+    
+    # print(V_o_dash_r)
+    # V_o_dash = V_o + (V_o_dash_r* time_delta)
+    # V_o_dash = V_o_dash_r* time_delta
+    
+    # V_o_dash = V_o_dash_r    
+    #%% Final voltage calc
+    
+    #Non ideal electrodes
+    Vu_p = mol_vol(Vu_p_df, x_pos)
+    Vu_n = mol_vol(Vu_n_df, x_neg)
+
+    
+    #initially there is no time lag
+    # V_o_dash = V_o
+    # Initial terminal voltage
+    # V_ini = mol_vol(Vu_bat_df, x_sp)
+    
+    #Final voltage
+    V_final = Vu_p - Vu_n - V_o_dash - V_neta_n_dash - V_neta_p_dash-0.1
+    
+    # print('V-final')
+    # print(V_final)
+    
+    q_max = Param_gen['q_max']
+    SOC_n = q_n/(0.6*q_max)
+
+
+# SOC apparent - only at surface (Li-ions in negative electrode, volume in negative electrode)
+    v_term = Param_n['vs']/ (Param_n['vs']+Param_n['vb'])
+    q_max_sn = 0.6*Param_gen['q_max']*v_term
+    SOC_a = q_sn/q_max_sn
+      
+    h_states = [time_delta,i_app, Param_gen['Temp'],V_final_old,V_final,SOC_n,SOC_a, x_sn, x_sp, Vu_p, Vu_n,V_o_dash,V_neta_n_dash, V_neta_p_dash, q_bn, q_sn, q_bp, q_sp,q_bulks,q_solids,q_totals, q_dot_bn, q_dot_sn, q_dot_sp, q_dot_bp, V_neta_n_dash_r, V_neta_p_dash_r]
+    
+    All_vars.append(h_states)
+
+df_output = pd.DataFrame(All_vars)
+df_output_heads = ['time_delta','i_app','Temp','V_final_old','V_final','SOC_n','SOC_a','x_sn', 'x_sp','Vu_p', 'Vu_n','V_o_dash','V_neta_n_dash', 'V_neta_p_dash', 'q_bn', 'q_sn', 'q_bp', 'q_sp','q_bulks','q_solids','q_totals','q_dot_bn', 'q_dot_sn', 'q_dot_sp', 'q_dot_bp', 'V_neta_n_dash_r', 'V_neta_p_dash_r']
+df_output.columns = df_output_heads
+
+#%%
+
+plt.plot(df_output.index*time_delta, df_output['V_final_old'])
+plt.plot(B0006_c5['time'], B0006_c5['Voltage [V]'])
+plt.xlabel("time [s]")
+plt.ylabel("Voltage [V]")
+plt.legend(['Sim', 'Experimental'])
+
+
+# plt.plot(df_output['x_sp'], df_output['V_final_old'])
+
+# plt.plot(df_output['q_dot_bp'])
+# plt.plot(df_output['q_dot_sp'])
+
+# plt.plot(df_output['q_dot_sn'])
+# plt.plot(df_output['q_dot_bn'])
+
+# plt.plot(df_output['V_neta_p_dash'])
+
+# plt.plot(df_output['Vu_p']-df_output['Vu_n'])
+# x1,x2,y1,y2 = plt.axis()  
+# plt.axis((x1,x2,0,5))
+# plt.plot(df_output['x_sn'])
+
+
+# x =Vu_bat_df.index.values
+# y = Vu_bat_df['Voltage'].values
+
+
+# from scipy import interpolate
+# tck = interpolate.splrep(x, y, s=0)
+# xnew = np.arange(0, 3600, 1)
+# ynew = interpolate.splev(xnew, tck, der=0)
+
+# plt.plot(xnew, ynew)
+
+# df = Vu_bat_df
+# df = df.reset_index(level=0)
+# df['index'] = df['index'].div(10000).multiply(3600)
+# plt.plot(df['index'], df['Voltage'])
+
+# i = pd.DatetimeIndex(start=df['Voltage'].min(), end=df['Voltage'].max(),    freq='H')
+# df = df.reindex(i).interpolate()
+
+'''
+PCYLLength, nCycles=PCYL.shape
+KRDarray=[PCYL.values[:,0]]
+KRDcolumlist=[PCYL.columns[0]]
+for i in range(1,nCycles):
+    P = butter_highpass_filter(PCYL.values[:,i], highcut, fs)
+    KRDarray.append(abs(P))
+    KRDcolumlist.append('Cycle '+str(i+1)+' data (bar)')
+KRDarray=np.transpose(np.asarray(KRDarray))
+KRD=pd.DataFrame(KRDarray)
+KRD.columns=KRDcolumlist
+
+'''
